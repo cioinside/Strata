@@ -14062,6 +14062,9 @@ int main(int argc, char** argv) {
                              "unfinished .tmp file(s) in %s\n", pruned, pruned_tmp, o.prompt_cache_disk.c_str());
         }
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+        // the disk scan numbered the checkpoints it loaded 1..N: the clock starts above them, or the first
+        // checkpoint this session saves looks like the oldest one and is the next victim
+        for (const ConvCheckpoint& c : checks) { if (c.used > check_clock) check_clock = c.used; }
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
         // checkpoints taken inside it
