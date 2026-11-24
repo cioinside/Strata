@@ -6869,8 +6869,13 @@ def toolkit_root_defs(nvcc) -> list:
 
 def engine_defs(archs, toolkit=13) -> list:
     """Extra CMake definitions for the engine: the experimental Pascal/Volta build (#295) for cards below sm_75, and
-    for every CUDA 12 engine (the same build as the ready-made CUDA 12 one: it admits the older cards)."""
-    return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if min(int(x) for x in archs) < 75 or int(toolkit) == 12 else []
+    for every CUDA 12 engine (the same build as the ready-made CUDA 12 one: it admits the older cards).
+    STRATA_CUDA_FLAGS - extra nvcc flags (glibc 2.42 declares cospi/sinpi/... as C23 functions, which collides
+    with the declarations in the toolkit's crt/math_functions.h; -U_GNU_SOURCE is the workaround)."""
+    defs = ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if min(int(x) for x in archs) < 75 or int(toolkit) == 12 else []
+    if os.environ.get("STRATA_CUDA_FLAGS"):
+        defs.append(f"-DCMAKE_CUDA_FLAGS={os.environ['STRATA_CUDA_FLAGS']}")
+    return defs
 
 
 def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
@@ -6961,6 +6966,11 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
         if vision == "gpu":
             defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
                      *toolkit_root_defs(nvcc)]
+            # STRATA_CUDA_FLAGS reaches the encoder too: on glibc >= 2.41 (Ubuntu 25.04+) the same
+            # bits/mathcalls.h clash stops nvcc's own compiler-ID probe, so the encoder cannot even be
+            # configured without it, let alone built. engine_defs() alone left setup --build half done.
+            if os.environ.get("STRATA_CUDA_FLAGS"):
+                defs.append(f"-DCMAKE_CUDA_FLAGS={os.environ['STRATA_CUDA_FLAGS']}")
         cmake_build(ROOT / "tools" / "vision", vdir, "strata-vision", defs, vcvars,
                     "build-vision-cuda12.bat" if t12 else "build-vision.bat")
         shutil.copy2(vdir / "bin" / VEXE, eng / VEXE)

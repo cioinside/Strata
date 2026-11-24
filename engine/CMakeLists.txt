@@ -276,6 +276,10 @@ target_link_libraries(strata-gguf PRIVATE strata_artifact)
 
 add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
+# strata-vision-quantize: quantizes clip.vision.* tensors F32 -> Q8_0 with the engine's faithful CUDA
+# quantize_q8_0. Needs the kernel library and the CUDA runtime (the host .cpp calls cudaMalloc itself).
+add_executable(strata-vision-quantize src/artifact/vision_quantize.cpp)
+target_link_libraries(strata-vision-quantize PRIVATE strata_artifact strata_kernels ${_strata_gpu_runtime_target})
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)

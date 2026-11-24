@@ -1125,6 +1125,24 @@ struct Options {
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
     bool prompt_cache_spread = false;   ///< --prompt-cache-spread: keep checkpoints spread back from the end, not the latest
+    /// --serve: keep OTHER conversations' checkpoints too (per-session retention). Without it, each request drops
+    /// every checkpoint that is not a prefix of its own prompt, so interleaved sessions re-read from scratch. With
+    /// it they are kept and evicted only by the --prompt-cache LRU cap; a session resumes from its own retained
+    /// checkpoint (running state restored, positional cells re-read from there), so cross-session thrash is gone.
+    bool prompt_cache_per_session = false;
+    /// --serve: a directory to persist conversation checkpoints to disk (empty = off). Each checkpoint is written
+    /// on creation and the set is loaded on start, so a restarted server resumes from where it left off instead of
+    /// re-reading every prompt. Bounded by the --prompt-cache cap like the in-RAM pool.
+    std::string prompt_cache_disk;
+    /// --serve: with --prompt-cache-disk, DELETE the files in that directory this model has just proved it cannot
+    /// read - another model's key, an older checkpoint format, a half-written file - instead of only logging them.
+    /// Off by default: the directory is allowed to hold several models' checkpoints (the model key leads the file
+    /// name precisely so they cannot collide), and starting one must not throw the others away. With one directory
+    /// per model, which is what setup writes and what our configs use, a re-quantized model or a changed --kv leaves
+    /// ~118 MB per file behind forever - the runtime LRU deletes a victim's file (see checkpoint_at) but nothing
+    /// ever collected the ones a start-up had already refused. Self-healing: every start sweeps, so orphans from any
+    /// cause go, not just the ones the current model key rejects.
+    bool prompt_cache_prune = false;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
@@ -1332,6 +1350,13 @@ void usage() {
                  "  --prompt-cache-spread  --serve: keep the checkpoints spread back from the conversation's end (dense\n"
                  "                       near it, thinner further back) instead of the most recently used: a client that\n"
                  "                       rewrites its history N tokens back reads about N again, not the whole conversation\n"
+                 "  --prompt-cache-per-session  --serve: keep other conversations' checkpoints too (per-session\n"
+                 "                       retention); without it interleaved sessions re-read their prompt from scratch\n"
+                 "  --prompt-cache-disk DIR   --serve: persist checkpoints to DIR so a restart resumes from them\n"
+                 "                       (each ~118 MB, bounded by --prompt-cache); empty/off by default\n"
+                 "  --prompt-cache-prune  --serve: with --prompt-cache-disk, delete at start-up the files there this\n"
+                 "                       model cannot read (another model, an older format, a half-written one) instead\n"
+                 "                       of only logging them; for a DIR that holds ONE model, so old files cannot pile up\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
@@ -2735,6 +2760,144 @@ private:
     uint64_t round_ = 0;
     bool stop_ = false;
 };
+// --prompt-cache-disk: persist conversation checkpoints to disk so a restarted server can resume from them. One
+// file per checkpoint (the running state gdn/ple/tails/dead/block_pos + per-stage parts, and the token ids).
+// Positional cells are NOT stored - on restore they are re-read from the checkpoint position, exactly as with
+// an in-RAM checkpoint. Version 2 adds the QSA indexer state (dead, block_pos) that 0.1.30's checkpoint carries.
+// Version 3 adds the MODEL KEY (ckpt_model_key): the stored running state is only meaningful for the weights and
+// the plan that produced it, and a checkpoint directory outlives a model swap. Two quantizations of one model
+// share a tokenizer, so the same conversation yields the SAME token ids and - before v3 - the same file name:
+// the second server resumed the first one's state and answered from another model's KV, silently. The key now
+// sits in the header (read back and compared, a mismatch rejects the file) and in the file name (so the two
+// models never collide on a path in the first place).
+namespace {
+constexpr uint32_t kCkptVersion = 3;
+const char kCkptMagic[4] = {'S', 'T', 'R', 'K'};
+
+uint64_t g_ckpt_model_key = 0;   // set once by ckpt_model_key() before the first checkpoint is read or written
+
+// What decides the stored bytes: the shape (the state layout and its sizes), the KV format and RoPE (the values
+// themselves), and the CONTENT identity of the weight files. The path is not enough - re-quantizing in place or
+// pointing --pack at another model keeps it - so a regular file contributes its size and its first bytes too.
+uint64_t ckpt_model_key(const Options& o, const strata::core::ModelGeometry& g) {
+    uint64_t h = 1469598103934665603ull;
+    const int64_t shape[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads,
+                             g.ssm_d_conv, g.n_head, g.n_head_kv, g.head_dim, g.idx_q_heads, g.idx_key_dim,
+                             g.hc, g.hc_lr, g.n_expert, g.n_ff};
+    h = fnv1a(shape, sizeof shape, h);
+    const uint8_t sep = 0x1f;   // so "ab" + "c" and "a" + "bc" cannot reach the same key
+    auto add_text = [&](const std::string& s) { h = fnv1a(s.data(), s.size(), h); h = fnv1a(&sep, 1, h); };
+    auto add_file = [&](const std::string& path) {
+        add_text(path);
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec)) return;   // a directory (--pack, --mtp): the name is all
+        const uintmax_t sz = std::filesystem::file_size(path, ec);
+        if (ec) return;
+        h = fnv1a(&sz, sizeof sz, h);
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr) return;
+        uint8_t head[512];
+        const size_t got = std::fread(head, 1, sizeof head, f);
+        std::fclose(f);
+        if (got) h = fnv1a(head, got, h);
+    };
+    add_text(o.kv);
+    add_text(o.rope_scaling);
+    h = fnv1a(&o.rope_scale, sizeof o.rope_scale, h);
+    add_file(o.native_preset);
+    add_file(o.pack + "/dense.bin");
+    add_file(o.ple_gguf);
+    add_file(o.embd_gguf);
+    add_file(o.mtp);
+    return h;
+}
+
+bool ckpt_write(const ConvCheckpoint& c, const std::string& path) {
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return false;
+    bool ok = true;
+    auto w = [&](const void* p, size_t n) { ok = ok && std::fwrite(p, 1, n, f) == n; };
+    auto wu32 = [&](uint32_t v) { w(&v, 4); };
+    auto wi32 = [&](int32_t v) { w(&v, 4); };
+    auto wi64 = [&](int64_t v) { w(&v, 8); };
+    auto wu64 = [&](uint64_t v) { w(&v, 8); };
+    auto wvec = [&](const std::vector<uint8_t>& v) { uint32_t n = (uint32_t) v.size(); wu32(n); if (n) w(v.data(), n); };
+    w(kCkptMagic, 4);
+    wu32(kCkptVersion);
+    wu64(g_ckpt_model_key);
+    wu32((uint32_t) c.ids.size());
+    for (int32_t t : c.ids) wi32(t);
+    wu32((uint32_t) c.imgs.size());
+    for (const ImgKey& im : c.imgs) { wi64(im.start); wu64(im.hash); }
+    wvec(c.gdn); wvec(c.ple); wvec(c.tails); wvec(c.dead); wvec(c.block_pos);
+    wu32((uint32_t) c.stage_parts.size());
+    for (const ConvCheckpoint& p : c.stage_parts) { wvec(p.gdn); wvec(p.ple); wvec(p.tails); wvec(p.dead); wvec(p.block_pos); }
+    bool good = ok && std::fclose(f) == 0;
+    if (good) good = std::rename(tmp.c_str(), path.c_str()) == 0;
+    else std::remove(tmp.c_str());
+    return good;
+}
+
+/// Why ckpt_read refused a file. --prompt-cache-prune deletes everything but `unreadable`: the rest are proofs that
+/// this model will never read the file again, so it is dead weight on disk. `unreadable` (fopen failed) is a
+/// permission or I/O problem, not a dead file, and a file that only fails to open must survive a retry.
+enum class CkptRefused { none, unreadable, foreign, older_format, another_model, truncated };
+
+bool ckpt_read(const std::string& path, ConvCheckpoint& c, CkptRefused* why = nullptr) {
+    if (why) *why = CkptRefused::none;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        if (why) *why = CkptRefused::unreadable;
+        return false;
+    }
+    bool ok = true;
+    auto r = [&](void* p, size_t n) { ok = ok && std::fread(p, 1, n, f) == n; };
+    auto ru32 = [&]() { uint32_t v = 0; r(&v, 4); return v; };
+    auto ri32 = [&]() { int32_t v = 0; r(&v, 4); return v; };
+    auto ri64 = [&]() { int64_t v = 0; r(&v, 8); return v; };
+    auto ru64 = [&]() { uint64_t v = 0; r(&v, 8); return v; };
+    auto rvec = [&](std::vector<uint8_t>& v) { uint32_t n = ru32(); v.resize(n); if (n) r(v.data(), n); };
+    char magic[4] = {0, 0, 0, 0};
+    r(magic, 4);
+    bool good = ok && magic[0] == 'S' && magic[1] == 'T' && magic[2] == 'R' && magic[3] == 'K';
+    if (!good && why && ok) *why = CkptRefused::foreign;   // not a STRK file at all
+    if (good) {
+        if (ru32() != kCkptVersion) {
+            good = false;
+            if (why) *why = CkptRefused::older_format;
+        }
+        if (good && ru64() != g_ckpt_model_key) {   // another model, another plan, or an older format: not ours
+            std::fprintf(stderr, "strata serve: checkpoint %s is for another model, ignored\n", path.c_str());
+            good = false;
+            if (why) *why = CkptRefused::another_model;
+        }
+        if (good) {
+            uint32_t nids = ru32(); c.ids.resize(nids);
+            for (uint32_t i = 0; i < nids && ok; ++i) c.ids[i] = ri32();
+            uint32_t nimg = ru32(); c.imgs.resize(nimg);
+            for (uint32_t i = 0; i < nimg && ok; ++i) { c.imgs[i].start = ri64(); c.imgs[i].hash = ru64(); }
+            rvec(c.gdn); rvec(c.ple); rvec(c.tails); rvec(c.dead); rvec(c.block_pos);
+            uint32_t nparts = ru32(); c.stage_parts.resize(nparts);
+            for (uint32_t i = 0; i < nparts && ok; ++i) { rvec(c.stage_parts[i].gdn); rvec(c.stage_parts[i].ple); rvec(c.stage_parts[i].tails); rvec(c.stage_parts[i].dead); rvec(c.stage_parts[i].block_pos); }
+        }
+    }
+    std::fclose(f);
+    // good && !ok: the header promised more bytes than the file holds. The write is rename-atomic (ckpt_write), so a
+    // short file was damaged after it landed and re-reading it will fail the same way - dead, and pruneable.
+    if (why && *why == CkptRefused::none && !(good && ok)) *why = CkptRefused::truncated;
+    return good && ok;
+}
+
+std::string ckpt_file_path(const std::string& dir, const ConvCheckpoint& c) {
+    // The model key leads the name so two models sharing one directory cannot write over each other even if the
+    // conversation's token ids (and therefore the id hash) are identical - which they are for two quantizations.
+    uint64_t h = fnv1a(c.ids.data(), (size_t) c.ids.size() * sizeof(int32_t));
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%016llx-%016llx", (unsigned long long) g_ckpt_model_key, (unsigned long long) h);
+    return dir + "/" + std::string(buf) + "-" + std::to_string(c.ids.size()) + ".ckpt";
+}
+}   // namespace
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
@@ -4111,6 +4274,9 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+        else if (a == "--prompt-cache-per-session") o.prompt_cache_per_session = true;
+        else if (a == "--prompt-cache-disk") o.prompt_cache_disk = next("--prompt-cache-disk");
+        else if (a == "--prompt-cache-prune") o.prompt_cache_prune = true;
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
@@ -13838,6 +14004,56 @@ int main(int argc, char** argv) {
         // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused.  STRATA_SLOT_CKPT_MOVE turns it on too: a moved
         // checkpoint frees nothing at the next prune, so every save would fault in fresh pages (17 -> 40-60 ms)
         CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env(), ckpt_pool_cap_env());
+        // Before the first disk read: every stored checkpoint belongs to the model and plan running right now.
+        g_ckpt_model_key = ckpt_model_key(o, g);
+        if (!o.prompt_cache_disk.empty() && o.prompt_cache > 0) {   // --prompt-cache-disk: resume from last run
+            std::error_code ec;
+            std::filesystem::create_directories(o.prompt_cache_disk, ec);
+            uint64_t stamp = 0;
+            int found = 0, skipped = 0, pruned = 0, pruned_tmp = 0;
+            // A .tmp is a write the rename never completed (a crash, a full disk): nothing ever reads it, so with
+            // pruning it goes too. The age guard keeps another process's in-flight write out of it.
+            const auto tmp_cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::hours(1);
+            for (auto& e : std::filesystem::directory_iterator(o.prompt_cache_disk, ec)) {
+                if (!e.is_regular_file()) continue;
+                const std::string nm = e.path().filename().string();
+                if (nm.size() > 4 && nm.compare(nm.size() - 4, 4, ".tmp") == 0) {
+                    std::error_code tec;
+                    if (e.last_write_time(tec) >= tmp_cutoff || tec) continue;
+                    if (std::filesystem::remove(e.path(), tec) && !tec) ++pruned_tmp;
+                    continue;
+                }
+                if (nm.size() < 6 || nm.compare(nm.size() - 5, 5, ".ckpt") != 0) continue;
+                ++found;
+                ConvCheckpoint c;
+                CkptRefused why = CkptRefused::none;
+                if (ckpt_read(e.path().string(), c, &why)) { c.used = ++stamp; checks.push_back(std::move(c)); continue; }
+                ++skipped;   // another model, another plan, or a format this build does not read
+                // Delete only on a POSITIVE proof of death - a reason ckpt_read was able to name. `unreadable`
+                // (fopen failed: permissions, I/O) and a hypothetical `none` both stay: a file we merely failed to
+                // open is not a file we proved useless, and guessing wrong here costs the user a resume.
+                const bool dead = o.prompt_cache_prune && why != CkptRefused::unreadable && why != CkptRefused::none;
+                if (dead) {
+                    std::error_code pec;
+                    if (std::filesystem::remove(e.path(), pec) && !pec) ++pruned;
+                }
+            }
+            while ((int) checks.size() > o.prompt_cache) {   // keep the most recently used cap of them
+                int victim = 0;
+                for (int i = 1; i < (int) checks.size(); ++i) if (checks[i].used < checks[victim].used) victim = i;
+                checks.erase(checks.begin() + victim);
+            }
+            if (!checks.empty())
+                std::fprintf(stderr, "strata serve: loaded %d conversation checkpoint(s) from %s (model %016llx)\n",
+                             (int) checks.size(), o.prompt_cache_disk.c_str(),
+                             (unsigned long long) g_ckpt_model_key);
+            if (skipped)   // not an error: a shared directory holds each model's own checkpoints, and an old
+                std::fprintf(stderr, "strata serve: %d of %d checkpoint file(s) in %s are for another model or an "
+                             "older format, ignored\n", skipped, found, o.prompt_cache_disk.c_str());
+            if (pruned || pruned_tmp)
+                std::fprintf(stderr, "strata serve: --prompt-cache-prune: deleted %d checkpoint file(s) and %d "
+                             "unfinished .tmp file(s) in %s\n", pruned, pruned_tmp, o.prompt_cache_disk.c_str());
+        }
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
@@ -14711,7 +14927,11 @@ int main(int argc, char** argv) {
             if (seg_plan.chunk > 0 && L > seg_plan.from && L < seg_plan.to) c.plan = seg_plan;   // inside a planned segment
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
-                auto old = [&](const ConvCheckpoint& k) { return old_tail >= 0 && (int64_t) k.ids.size() == old_tail; };
+                if (old_tail >= 0 && !o.prompt_cache_disk.empty())
+                    for (const ConvCheckpoint& k : checks)   // its disk file goes with it, or --prompt-cache-disk
+                        if (!k.pinned && (int64_t) k.ids.size() == old_tail)   // would not stay bounded by --prompt-cache
+                            std::remove(ckpt_file_path(o.prompt_cache_disk, k).c_str());
+                const auto old = [&](const ConvCheckpoint& k) { return old_tail >= 0 && (int64_t) k.ids.size() == old_tail; };
                 if (ckpt_pool.on())
                     ckpt_pool.erase_if(checks, old);
                 else
@@ -14720,6 +14940,7 @@ int main(int argc, char** argv) {
             } else if (L == tail_ckpt_len) {
                 tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
             }
+            if (!o.prompt_cache_disk.empty()) ckpt_write(c, ckpt_file_path(o.prompt_cache_disk, c));
             checks.push_back(std::move(c));
             const Clock::time_point te0 = Clock::now();
             const size_t before_evict = checks.size();
@@ -14749,6 +14970,8 @@ int main(int argc, char** argv) {
                                                                  o.prompt_cache, tail_flags.get(), pin_flags.get())
                     : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache,
                                                                    tail_flags.get(), pin_flags.get());
+                if (!o.prompt_cache_disk.empty())   // the evicted checkpoint's file goes with it, so the directory
+                                                            std::remove(ckpt_file_path(o.prompt_cache_disk, checks[victim]).c_str());   // stays bounded
                 ckpt_pool.give(std::move(checks[victim]));   // (STRATA_CKPT_POOL; else nothing)
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
@@ -20060,6 +20283,14 @@ int main(int argc, char** argv) {
                 ckpt_pool.erase_if(checks, off_path);
             else
                 checks.erase(std::remove_if(checks.begin(), checks.end(), off_path), checks.end());
+            // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new.
+            // Per-session retention: keep them - each session resumes from its own retained checkpoint (running state
+            // restored, positional cells re-read from there), so cross-session thrash is gone; the --prompt-cache LRU
+            // cap in checkpoint_at bounds memory.
+            if (!o.prompt_cache_per_session)
+                checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+                                 return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
+                             }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
@@ -20082,7 +20313,7 @@ int main(int argc, char** argv) {
                     strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
                     cudaStreamSynchronize(st->stream);
                 }
-                checks.clear();
+                if (!o.prompt_cache_per_session) checks.clear();   // per-session: keep other conversations' checkpoints
             } else if (!from_live) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
