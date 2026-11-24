@@ -14027,7 +14027,19 @@ int main(int argc, char** argv) {
                 ++found;
                 ConvCheckpoint c;
                 CkptRefused why = CkptRefused::none;
-                if (ckpt_read(e.path().string(), c, &why)) { c.used = ++stamp; checks.push_back(std::move(c)); continue; }
+                if (ckpt_read(e.path().string(), c, &why)) {
+                    c.used = ++stamp;
+                    checks.push_back(std::move(c));
+                    // The cap is a RAM cap: drop the oldest as we go.  The scan used to read every checkpoint of the
+                    // directory first and trim afterwards, so a directory with 900 files (100 GiB) was read into RAM
+                    // whole before the cap applied - the follower started with that much private memory (SYN-804).
+                    while ((int) checks.size() > o.prompt_cache) {
+                        int victim = 0;
+                        for (int i = 1; i < (int) checks.size(); ++i) if (checks[i].used < checks[victim].used) victim = i;
+                        checks.erase(checks.begin() + victim);
+                    }
+                    continue;
+                }
                 ++skipped;   // another model, another plan, or a format this build does not read
                 // Delete only on a POSITIVE proof of death - a reason ckpt_read was able to name. `unreadable`
                 // (fopen failed: permissions, I/O) and a hypothetical `none` both stay: a file we merely failed to
@@ -14037,11 +14049,6 @@ int main(int argc, char** argv) {
                     std::error_code pec;
                     if (std::filesystem::remove(e.path(), pec) && !pec) ++pruned;
                 }
-            }
-            while ((int) checks.size() > o.prompt_cache) {   // keep the most recently used cap of them
-                int victim = 0;
-                for (int i = 1; i < (int) checks.size(); ++i) if (checks[i].used < checks[victim].used) victim = i;
-                checks.erase(checks.begin() + victim);
             }
             if (!checks.empty())
                 std::fprintf(stderr, "strata serve: loaded %d conversation checkpoint(s) from %s (model %016llx)\n",
